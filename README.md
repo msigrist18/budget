@@ -6,6 +6,9 @@ Eine private Budget-App fürs iPhone und den PC. Sie läuft komplett im Browser.
 
 ## Was die App kann
 
+- **Heute:** Wie viel du im Alltag (z.B. Essen, Freizeit) bis Monatsende noch hast, und ungefähr pro Tag. Dazu fällige Rechnungen, die nächste Import-Erinnerung und wann der Lohn kommt.
+- **Kategorien mit Unterkategorien** (z.B. Freizeit › Dates, teilen sich ein Budget) und **beschriftete Beträge** für Einmaliges (z.B. «Steuern 2026» in der Kategorie Steuern). Kategorien lassen sich zusammenführen.
+- **Zwischenstand:** Auszug auch mitten im Monat laden. Die App sagt dir, welchen Zeitraum, und ignoriert doppelte Buchungen. Kalender-Erinnerungen am 10. und am Zahltag.
 - **Budgetmonat von Zahltag zu Zahltag** (Standard: 25. bis 24.). Der Lohn vom 25.12. ist das Geld für den Januar.
 - **Plan** mit Einnahmen, Sparen & Investieren, Fixkosten, Alltag, Einmaligem und Schulden. Beträge können monatlich, alle 3 oder 6 Monate, jährlich oder einmalig sein.
 - **Übertrag:** Was in einem Monat übrig bleibt, geht automatisch in den nächsten.
@@ -33,7 +36,7 @@ Die Homescreen-App hat ihren eigenen Speicher, getrennt von Safari. Nur dort lö
 
 ## Monatsablauf
 
-1. Ende Monat im LUKB E-Banking: **Vermögen → Kontoauszug → Filter** (25. bis 24.) → **Exportieren** (PDF).
+1. Um den 10. (Zwischenstand) und nach dem Zahltag (Monatsabschluss) im LUKB E-Banking: **Vermögen → Kontoauszug → Filter** → **Exportieren** (PDF). Den Zeitraum zeigt dir die App.
 2. In der App: **Buchungen → Auszug laden**.
 3. Unbekannte Buchungen zuordnen (die App merkt sich die Läden).
 4. **Mehr → Backup erstellen** und die Datei in iCloud Drive sichern oder per AirDrop an den PC schicken.

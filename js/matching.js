@@ -13,7 +13,8 @@ export function prepareImport(parsedTxs, data, settings) {
   for (const p of parsedTxs) {
     if (existingKeys.has(p.importKey)) { duplicates++; continue; }
     const sug = suggestCategory(p, data.rules, settings, catById);
-    fresh.push({ ...p, categoryId: sug.categoryId, suggestSource: sug.source, learn: true });
+    // TWINT von/an Personen nicht automatisch merken (z.B. Rückzahlungen von Freunden)
+    fresh.push({ ...p, categoryId: sug.categoryId, suggestSource: sug.source, learn: !/twint/i.test(p.type || '') });
   }
 
   // Handeinträge (z.B. vorab erfasst) mit gleicher Summe und ähnlichem Datum

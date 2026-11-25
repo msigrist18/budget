@@ -282,3 +282,21 @@ textarea.input { min-height: 72px; resize: vertical; }
 a { color: var(--accent); }
 details summary { cursor: pointer; color: var(--accent); font-weight: 600; margin: 8px 0; }
 .lines { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
+
+/* Version 1.1: Unterkategorien, Heute */
+.cat.sub { padding: 4px 16px 9px 30px; border-top: 0; }
+.cat.sub .cat-name, .cat.sub .cat-val { font-size: 14px; color: var(--muted); }
+.row.subrow { padding-left: 32px; background: var(--card-2); }
+.today-date { color: var(--muted); font-size: 15px; margin: 0 0 2px; }
+.stand { font-size: 13px; color: var(--muted); margin: 10px 4px 4px; }
+.day-item { padding: 13px 16px 14px; border-top: 1px solid var(--line); cursor: pointer; }
+.group-head + .day-item { border-top: 0; }
+.day-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.day-name { font-weight: 600; font-size: 17px; }
+.day-big { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; color: var(--accent); }
+.day-big small { font-size: 13px; font-weight: 600; color: var(--muted); letter-spacing: 0; }
+.day-big.minus { color: var(--minus); }
+.day-sub { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; color: var(--muted); margin-top: 3px; }
+.day-sub b { color: var(--text); }
+.day-subline { font-size: 13px; color: var(--muted); margin-top: 6px; }
+.backbtn { margin: 0 0 -4px -10px; }

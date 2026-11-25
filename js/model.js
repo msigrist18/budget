@@ -1,7 +1,8 @@
-// Budget-Logik: Budgetmonate (Zahltag bis Zahltag), Plan, Übertrag, Plan vs. Ist.
+// Budget-Logik: Budgetmonate (Zahltag bis Zahltag), Plan, Übertrag, Plan vs. Ist,
+// Unterkategorien, Zusammenführen, Heute-Übersicht und Import-Erinnerung.
 // Reine Funktionen ohne DOM, damit sie auch in Node getestet werden können.
 
-import { round2, pad2 } from './format.js';
+import { round2, pad2, daysBetween } from './format.js';
 
 export const GROUPS = [
   { id: 'einnahmen', name: 'Einnahmen', income: true },
@@ -27,6 +28,7 @@ export const DEFAULT_SETTINGS = {
   startMonth: null, // erster Budgetmonat, z.B. "2026-12"
   startCarry: 0, // Übertrag in den ersten Monat
   foodCategoryId: null, // Kategorie für die Lebensmittel-Auswertung
+  midImportAfterDays: 14, // Zwischenstand: Erinnerung nach so vielen Tagen
 };
 
 // ---------- Monats-Helfer ("YYYY-MM") ----------
@@ -72,6 +74,33 @@ export function monthRange(key, payday = 25) {
   return { start: isoFromParts(y, m - 1, payday), end: isoFromParts(y, m, payday - 1) };
 }
 
+// ---------- Kategorien (mit Unterkategorien) ----------
+
+// Unterkategorie = hat parentId, und die Hauptkategorie existiert noch
+export function parentOf(cat, catById) {
+  return cat && cat.parentId && catById[cat.parentId] && cat.parentId !== cat.id ? catById[cat.parentId] : null;
+}
+
+export function effectiveGroup(cat, catById) {
+  const p = parentOf(cat, catById);
+  return p ? p.group : cat.group;
+}
+
+export function sortedCategories(categories, groupId) {
+  return categories
+    .filter((c) => !groupId || c.group === groupId)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name, 'de'));
+}
+
+export function topCategories(categories, groupId) {
+  const byId = Object.fromEntries(categories.map((c) => [c.id, c]));
+  return sortedCategories(categories.filter((c) => !parentOf(c, byId)), groupId);
+}
+
+export function childCategories(categories, parentId) {
+  return sortedCategories(categories.filter((c) => c.parentId === parentId && c.id !== parentId));
+}
+
 // ---------- Plan ----------
 
 export function planAmount(entry, key) {
@@ -89,24 +118,27 @@ export function planForCategory(plan, categoryId, key) {
   return round2(s);
 }
 
+// Hauptkategorie inkl. Unterkategorien
+export function planForTree(plan, categories, categoryId, key) {
+  let s = planForCategory(plan, categoryId, key);
+  for (const c of childCategories(categories, categoryId)) s += planForCategory(plan, c.id, key);
+  return round2(s);
+}
+
 // ---------- Buchungen ----------
 
 export function txMonth(tx, settings, catById) {
   if (tx.month) return tx.month;
   const cat = tx.categoryId ? catById[tx.categoryId] : null;
+  const parent = cat ? parentOf(cat, catById) : null;
+  const early = (cat && cat.early) || (parent && parent.early);
   const iso = tx.bookDate || tx.date;
-  return budgetMonthOf(iso, settings.payday, cat && cat.early ? settings.earlyFrom : null);
+  return budgetMonthOf(iso, settings.payday, early ? settings.earlyFrom : null);
 }
 
 export function invoiceMonth(inv, settings) {
   if (inv.month) return inv.month;
   return budgetMonthOf(inv.due || inv.created, settings.payday, null);
-}
-
-export function sortedCategories(categories, groupId) {
-  return categories
-    .filter((c) => !groupId || c.group === groupId)
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name, 'de'));
 }
 
 // Indexe einmal berechnen, damit die Monatsübersicht schnell bleibt
@@ -140,31 +172,31 @@ export function monthStatus(key, settings, today) {
 // result: Was am Ende übrig bleibt und in den nächsten Monat geht.
 //  - vorbei + importiert: echte Zahlen (Ist)
 //  - sonst: Prognose (Plan, aber wo schon mehr ausgegeben wurde, zählt das Ist)
+// Unterkategorien werden in ihre Hauptkategorie eingerechnet (gemeinsames Budget).
 export function summarizeMonth(key, data, idx, carryIn, today) {
-  const { settings, txByMonth, invByMonth } = idx;
+  const { settings, txByMonth, invByMonth, catById } = idx;
   const txs = txByMonth.get(key) || [];
   const invs = invByMonth.get(key) || [];
   const status = monthStatus(key, settings, today);
   const hasData = txs.length > 0;
 
   const actualByCat = new Map();
-  const unc = { count: 0, inSum: 0, outSum: 0, items: [] };
+  const unc = { count: 0, inSum: 0, outSum: 0 };
   for (const tx of txs) {
-    const cat = tx.categoryId ? idx.catById[tx.categoryId] : null;
+    const cat = tx.categoryId ? catById[tx.categoryId] : null;
     if (!cat) {
       unc.count++;
-      unc.items.push(tx);
       if (tx.amount > 0) unc.inSum += tx.amount; else unc.outSum += -tx.amount;
       continue;
     }
-    const g = GROUP_BY_ID[cat.group];
+    const g = GROUP_BY_ID[effectiveGroup(cat, catById)];
     const v = g && g.income ? tx.amount : -tx.amount;
     actualByCat.set(cat.id, (actualByCat.get(cat.id) || 0) + v);
   }
   let openInvoices = 0;
   for (const inv of invs) {
     openInvoices += inv.amount;
-    if (inv.categoryId && idx.catById[inv.categoryId]) {
+    if (inv.categoryId && catById[inv.categoryId]) {
       actualByCat.set(inv.categoryId, (actualByCat.get(inv.categoryId) || 0) + inv.amount);
     } else {
       unc.outSum += inv.amount;
@@ -176,14 +208,23 @@ export function summarizeMonth(key, data, idx, carryIn, today) {
   for (const g of GROUPS) {
     const cats = [];
     let gp = 0, ga = 0, gf = 0;
-    for (const c of sortedCategories(data.categories, g.id)) {
-      const plan = planForCategory(data.plan, c.id, key);
-      const actual = round2(actualByCat.get(c.id) || 0);
-      let forecast;
-      if (g.income) forecast = actual !== 0 ? actual : plan;
-      else forecast = Math.max(plan, actual);
+    for (const c of topCategories(data.categories, g.id)) {
+      const ownPlan = planForCategory(data.plan, c.id, key);
+      const ownActual = round2(actualByCat.get(c.id) || 0);
+      const subs = childCategories(data.categories, c.id).map((s) => {
+        const plan = planForCategory(data.plan, s.id, key);
+        const actual = round2(actualByCat.get(s.id) || 0);
+        return { id: s.id, name: s.name, plan, actual, over: !g.income && plan > 0 && actual > plan + 0.004 };
+      });
+      const plan = round2(ownPlan + subs.reduce((x, s) => x + s.plan, 0));
+      const actual = round2(ownActual + subs.reduce((x, s) => x + s.actual, 0));
+      const forecast = g.income ? (actual !== 0 ? actual : plan) : Math.max(plan, actual);
       if (plan === 0 && actual === 0) continue;
-      cats.push({ id: c.id, name: c.name, plan, actual, forecast, over: !g.income && actual > plan + 0.004 });
+      cats.push({
+        id: c.id, name: c.name, plan, actual, forecast, ownPlan, ownActual,
+        over: !g.income && actual > plan + 0.004,
+        subs: subs.filter((s) => s.plan !== 0 || s.actual !== 0),
+      });
       gp += plan; ga += actual; gf += forecast;
     }
     groups.push({ id: g.id, name: g.name, income: !!g.income, plan: round2(gp), actual: round2(ga), forecast: round2(gf), cats });
@@ -226,7 +267,6 @@ export function summarizeUntil(toKey, data, today) {
   const start = s.startMonth || toKey;
   const out = new Map();
   if (ymDiff(start, toKey) < 0) {
-    // Monat vor dem Start: ohne Übertrag
     out.set(toKey, summarizeMonth(toKey, data, idx, 0, today));
     return out;
   }
@@ -237,6 +277,110 @@ export function summarizeUntil(toKey, data, today) {
     carry = sm.result;
   }
   return out;
+}
+
+// ---------- Heute ----------
+
+// Für jede Alltag-Kategorie: noch übrig im Monat und ungefähr pro Tag.
+export function dailyOverview(sm, today) {
+  const daysLeft = Math.max(1, daysBetween(today, sm.range.end) + 1);
+  const g = sm.groups.find((x) => x.id === 'alltag');
+  const items = (g ? g.cats : [])
+    .filter((c) => c.plan > 0)
+    .map((c) => {
+      const left = round2(c.plan - c.actual);
+      return {
+        id: c.id, name: c.name, plan: c.plan, actual: c.actual, left,
+        perDay: round2(Math.max(0, left) / daysLeft),
+        subs: c.subs,
+      };
+    });
+  return { daysLeft, end: sm.range.end, items };
+}
+
+// Wann wurde zuletzt importiert, und bis zu welchem Buchungsdatum?
+export function importStatus(txs) {
+  let lastBook = null, lastAt = null;
+  for (const t of txs) {
+    if (t.source !== 'import') continue;
+    if (t.bookDate && (!lastBook || t.bookDate > lastBook)) lastBook = t.bookDate;
+    const at = (t.importedAt || '').slice(0, 10);
+    if (at && (!lastAt || at > lastAt)) lastAt = at;
+  }
+  return { lastBook, lastAt };
+}
+
+// Erinnerung: Monatsabschluss für den Vormonat oder Zwischenstand im laufenden Monat
+export function importHint(txs, settingsIn, today) {
+  const settings = { ...DEFAULT_SETTINGS, ...(settingsIn || {}) };
+  const { lastBook, lastAt } = importStatus(txs);
+  const cur = budgetMonthOf(today, settings.payday);
+  const cr = monthRange(cur, settings.payday);
+  const prev = ymAdd(cur, -1);
+  const pr = monthRange(prev, settings.payday);
+  const start = settings.startMonth;
+  if (start && ymDiff(start, prev) >= 0 && (!lastAt || lastAt <= pr.end)) {
+    return { kind: 'abschluss', month: prev, from: lastBook && lastBook >= pr.start ? lastBook : pr.start, to: pr.end };
+  }
+  const since = lastAt && lastAt > cr.start ? lastAt : cr.start;
+  const daysLeft = daysBetween(today, cr.end);
+  if (daysBetween(since, today) >= (settings.midImportAfterDays || 14) && daysLeft > 3) {
+    return { kind: 'zwischen', month: cur, from: lastBook && lastBook >= cr.start ? lastBook : cr.start, to: today };
+  }
+  return null;
+}
+
+// Nächster Zahltag (ohne Wochenend-Korrektur)
+export function nextPayday(today, payday = 25) {
+  const d = Number(today.slice(8, 10));
+  const ym = today.slice(0, 7);
+  const target = d <= payday ? `${ym}-${pad2(payday)}` : `${ymAdd(ym, 1)}-${pad2(payday)}`;
+  return { date: target, days: daysBetween(today, target) };
+}
+
+// ---------- Zusammenführen ----------
+
+// Kategorie "fromId" in "toId" zusammenführen. Gibt die Datenbank-Änderungen zurück.
+export function mergeCategoryOps(data, fromId, toId) {
+  const byId = Object.fromEntries(data.categories.map((c) => [c.id, c]));
+  const from = byId[fromId];
+  const to = byId[toId];
+  if (!from || !to || fromId === toId) throw new Error('Ungültige Auswahl.');
+  if (to.parentId === fromId) throw new Error('Eine Unterkategorie kann nicht das Ziel sein.');
+  const ops = [];
+  const counts = { plan: 0, txs: 0, invoices: 0, rules: 0, subs: 0 };
+  for (const e of data.plan) {
+    if (e.categoryId !== fromId) continue;
+    ops.push({ store: 'plan', type: 'put', value: { ...e, categoryId: toId, label: e.label || from.name } });
+    counts.plan++;
+  }
+  for (const t of data.txs) {
+    if (t.categoryId !== fromId) continue;
+    ops.push({ store: 'txs', type: 'put', value: { ...t, categoryId: toId } });
+    counts.txs++;
+  }
+  for (const i of data.invoices || []) {
+    if (i.categoryId !== fromId) continue;
+    ops.push({ store: 'invoices', type: 'put', value: { ...i, categoryId: toId } });
+    counts.invoices++;
+  }
+  for (const r of data.rules || []) {
+    if (r.categoryId !== fromId) continue;
+    ops.push({ store: 'rules', type: 'put', value: { ...r, categoryId: toId } });
+    counts.rules++;
+  }
+  const toParent = parentOf(to, byId);
+  const newParent = toParent ? toParent.id : to.id;
+  const newGroup = toParent ? toParent.group : to.group;
+  for (const c of data.categories) {
+    if (c.parentId !== fromId || c.id === fromId) continue;
+    ops.push({ store: 'categories', type: 'put', value: { ...c, parentId: newParent, group: newGroup } });
+    counts.subs++;
+  }
+  if (from.early && !to.early) ops.push({ store: 'categories', type: 'put', value: { ...to, early: true } });
+  ops.push({ store: 'categories', type: 'del', key: fromId });
+  const settingsPatch = data.settings && data.settings.foodCategoryId === fromId ? { foodCategoryId: toId } : null;
+  return { ops, counts, settingsPatch };
 }
 
 // ---------- Lebensmittel-Auswertung ----------
@@ -259,7 +403,6 @@ export function foodStats(data, today, brandOf) {
     }
   }
   const list = [...months.values()].sort((a, b) => ymDiff(b.key, a.key));
-  // Durchschnitt nur über abgeschlossene Monate mit importierten Daten
   const closed = list.filter((m) => monthStatus(m.key, idx.settings, today) === 'vorbei');
   const base = closed.length ? closed : list;
   const avg = base.length ? round2(base.reduce((s, m) => s + m.total, 0) / base.length) : 0;

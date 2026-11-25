@@ -42,15 +42,67 @@ export function invoiceIcs(inv, amountText) {
   return lines.join('\r\n');
 }
 
-export function openIcs(inv, amountText) {
-  const blob = new Blob([invoiceIcs(inv, amountText)], { type: 'text/calendar;charset=utf-8' });
+function nextDayOfMonth(day) {
+  const now = new Date();
+  let y = now.getFullYear(), m = now.getMonth();
+  if (now.getDate() > day) m += 1;
+  const d = new Date(Date.UTC(y, m, day));
+  return d.toISOString().slice(0, 10);
+}
+
+// Wiederkehrende Erinnerungen: Zwischenstand und Monatsabschluss
+export function remindersIcs(midDay, payday) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const how = 'LUKB E-Banking: Vermögen → Kontoauszug → Filter → Exportieren (PDF). Danach in der Budget-App: Buchungen → Auszug laden. Doppelte Buchungen ignoriert die App.';
+  const ev = (uid, day, summary, desc) => {
+    const start = nextDayOfMonth(day);
+    const next = new Date(start + 'T00:00:00Z');
+    next.setUTCDate(next.getUTCDate() + 1);
+    return [
+      'BEGIN:VEVENT',
+      `UID:${uid}@budget`,
+      `DTSTAMP:${stamp}`,
+      `DTSTART;VALUE=DATE:${icsDate(start)}`,
+      `DTEND;VALUE=DATE:${next.toISOString().slice(0, 10).replace(/-/g, '')}`,
+      `RRULE:FREQ=MONTHLY;BYMONTHDAY=${day}`,
+      `SUMMARY:${escIcs(summary)}`,
+      `DESCRIPTION:${escIcs(desc)}`,
+      'BEGIN:VALARM',
+      'ACTION:DISPLAY',
+      `DESCRIPTION:${escIcs(summary)}`,
+      'TRIGGER:PT18H',
+      'END:VALARM',
+      'END:VEVENT',
+    ];
+  };
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Budget//Erinnerungen//DE',
+    'CALSCALE:GREGORIAN',
+    ...ev('budget-zwischenstand', midDay, 'Budget: Zwischenstand – Auszug laden', `Lade den Auszug seit dem letzten Import. ${how}`),
+    ...ev('budget-monatsabschluss', payday, 'Budget: Monatsabschluss – Auszug laden', `Lade den Auszug bis gestern (Monatsende). ${how}`),
+    'END:VCALENDAR',
+  ].join('\r\n');
+}
+
+function openIcsText(text, filename) {
+  const blob = new Blob([text], { type: 'text/calendar;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   // Auf dem iPhone öffnet Safari die Datei direkt im Kalender
-  if (!/iPhone|iPad/i.test(navigator.userAgent)) a.download = `Rechnung-${inv.name.replace(/[^\wäöüÄÖÜ-]+/g, '_')}.ics`;
+  if (!/iPhone|iPad/i.test(navigator.userAgent)) a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+export function openIcs(inv, amountText) {
+  openIcsText(invoiceIcs(inv, amountText), `Rechnung-${inv.name.replace(/[^\wäöüÄÖÜ-]+/g, '_')}.ics`);
+}
+
+export function openReminders(midDay, payday) {
+  openIcsText(remindersIcs(midDay, payday), 'Budget-Erinnerungen.ics');
 }

@@ -3,7 +3,8 @@
 import * as db from './db.js';
 import {
   GROUPS, RHYTHMS, DEFAULT_SETTINGS, budgetMonthOf, monthRange, ymAdd, ymDiff,
-  summarizeUntil, foodStats, txMonth, invoiceMonth, sortedCategories, planForCategory,
+  summarizeUntil, foodStats, txMonth, invoiceMonth, sortedCategories, planForCategory, planForTree,
+  topCategories, childCategories, parentOf, dailyOverview, importStatus, importHint, nextPayday, mergeCategoryOps,
 } from './model.js';
 import {
   chf, parseAmount, todayISO, fmtDate, fmtDateShort, monthLabel, monthShort, esc, uid, daysBetween,
@@ -14,9 +15,10 @@ import { parseLukb } from './lukb.js';
 import { prepareImport } from './matching.js';
 import { prepareReceipt } from './receipts.js';
 import { encryptPayload, decryptFile, inspectFile, backupFileName, deliverFile, blobToB64, b64ToBlob } from './backup.js';
-import { openIcs } from './ics.js';
+import { openIcs, openReminders } from './ics.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
+const MID_DAY = 10; // Kalender-Erinnerung Zwischenstand
 
 // ---------------------------------------------------------------- Zustand
 
@@ -28,7 +30,8 @@ const S = {
   invoices: [],
   rules: [],
   receipts: [],
-  tab: 'uebersicht',
+  tab: 'heute',
+  backTab: 'heute',
   month: null,
   txFilter: 'alle',
   loaded: false,
@@ -49,6 +52,11 @@ function data() {
 function catById() {
   return Object.fromEntries(S.categories.map((c) => [c.id, c]));
 }
+function catLabel(c, cbi = catById()) {
+  if (!c) return '';
+  const p = parentOf(c, cbi);
+  return p ? `${p.name} › ${c.name}` : c.name;
+}
 function currentMonth() {
   return budgetMonthOf(todayISO(), S.settings.payday);
 }
@@ -67,6 +75,9 @@ function addDays(iso, n) {
 }
 function monthName(key) {
   return MONTHS_DE[Number(key.slice(5, 7)) - 1];
+}
+function idsWithChildren(id) {
+  return [id, ...childCategories(S.categories, id).map((c) => c.id)];
 }
 
 async function load() {
@@ -95,9 +106,9 @@ async function saveSettings(patch) {
 // ---------------------------------------------------------------- Icons
 
 const ICON = {
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></svg>',
   home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9v9h9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/></svg>',
   list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>',
-  bill: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h12v20l-3-2-3 2-3-2-3 2z"/><path d="M9 7h6M9 11h6M9 15h3"/></svg>',
   plan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg>',
   more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>',
   left: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
@@ -106,16 +117,26 @@ const ICON = {
 
 // ---------------------------------------------------------------- Bausteine
 
-function catOptions(selected, noneLabel = '— ohne Kategorie —') {
+// Auswahlliste mit Haupt- und Unterkategorien und "+ Neue Kategorie"
+function catOptions(selected, noneLabel = '— ohne Kategorie —', { allowNew = true, exclude = [] } = {}) {
   let h = `<option value="">${esc(noneLabel)}</option>`;
+  const opt = (id, label) => `<option value="${esc(id)}"${id === selected ? ' selected' : ''}>${esc(label)}</option>`;
   for (const g of GROUPS) {
-    const cats = sortedCategories(S.categories, g.id);
-    if (!cats.length) continue;
+    const tops = topCategories(S.categories, g.id).filter((c) => !exclude.includes(c.id));
+    if (!tops.length) continue;
     h += `<optgroup label="${esc(g.name)}">`;
-    for (const c of cats) h += `<option value="${esc(c.id)}"${c.id === selected ? ' selected' : ''}>${esc(c.name)}</option>`;
+    for (const c of tops) {
+      h += opt(c.id, c.name);
+      for (const s of childCategories(S.categories, c.id)) if (!exclude.includes(s.id)) h += opt(s.id, `${c.name} › ${s.name}`);
+    }
     h += '</optgroup>';
   }
+  if (allowNew) h += '<option value="__new">＋ Neue Kategorie …</option>';
   return h;
+}
+
+function catSelect(name, selected, { noneLabel = '— ohne Kategorie —', attrs = '' } = {}) {
+  return `<select class="input" ${name ? `name="${name}"` : ''} data-catsel data-none="${esc(noneLabel)}" data-prev="${esc(selected || '')}" ${attrs}>${catOptions(selected, noneLabel)}</select>`;
 }
 
 function monthList(extra = []) {
@@ -153,10 +174,12 @@ function rhythmLabel(every) {
   return r ? r.label : 'monatlich';
 }
 
+// Rückgabe ist HTML (Bezeichnung wird escaped)
 function entrySummary(e) {
   const amt = chf(e.amount);
-  if (Number(e.every) === 0) return `${amt} einmalig im ${monthShort(e.start)}`;
-  return `${amt} ${rhythmLabel(e.every)} · ${monthShort(e.start)} – ${e.end ? monthShort(e.end) : 'offen'}`;
+  const lbl = e.label ? `<b>${esc(e.label)}</b> · ` : '';
+  if (Number(e.every) === 0) return `${lbl}${amt} einmalig im ${monthShort(e.start)}`;
+  return `${lbl}${amt} ${rhythmLabel(e.every)} · ${monthShort(e.start)} – ${e.end ? monthShort(e.end) : 'offen'}`;
 }
 
 function receiptsOf(ownerType, ownerId) {
@@ -170,6 +193,26 @@ function dueInfo(inv) {
   if (d === 1) return { text: 'morgen fällig', cls: 'warn', d };
   if (d <= 7) return { text: `in ${d} Tagen fällig`, cls: 'warn', d };
   return { text: `fällig ${fmtDateShort(inv.due)}`, cls: 'grey', d };
+}
+
+function importHintHtml(compact = false) {
+  const h = importHint(S.txs, S.settings, todayISO());
+  if (!h) return '';
+  const range = `vom <b>${fmtDate(h.from)}</b> bis <b>${h.kind === 'zwischen' ? 'heute' : fmtDate(h.to)}</b>`;
+  if (compact) return `<p class="small muted" style="margin:2px 4px 8px">📄 Nächster Auszug: ${range}</p>`;
+  return notice({
+    ico: '📄',
+    title: h.kind === 'abschluss' ? `Monatsabschluss ${monthName(h.month)}` : 'Zeit für einen Zwischenstand',
+    text: `Lade den Auszug ${range} hoch. Doppelte Buchungen ignoriert die App.`,
+    actions: '<button class="btn small" data-act="import-pdf">Auszug laden</button>',
+  });
+}
+
+function backupNotice() {
+  const lb = S.settings.lastBackup;
+  const lbDays = lb ? daysBetween(lb.slice(0, 10), todayISO()) : null;
+  if (!S.txs.length || (lbDays !== null && lbDays <= 30)) return '';
+  return notice({ ico: '💾', title: lb ? `Letztes Backup vor ${lbDays} Tagen` : 'Noch kein Backup', text: 'Deine Daten gibt es nur auf diesem Gerät. Ein Backup schützt vor Verlust.', actions: '<button class="btn small" data-act="backup">Backup erstellen</button>' });
 }
 
 // ---------------------------------------------------------------- Toast
@@ -208,15 +251,19 @@ function sheetHead(title) {
   return `<div class="sheet-head"><h2>${esc(title)}</h2><button class="close" data-act="sheet-close" aria-label="Schliessen">✕</button></div>`;
 }
 
+function overlay(innerHtml) {
+  const box = document.createElement('div');
+  box.className = 'sheet-overlay';
+  box.style.zIndex = 60;
+  box.innerHTML = innerHtml;
+  document.body.appendChild(box);
+  return box;
+}
+
 function ask(title, text, okLabel = 'OK', danger = false) {
   return new Promise((resolve) => {
-    const prev = SH ? { html: sheetRoot.innerHTML, ctx: SH } : null;
-    const box = document.createElement('div');
-    box.className = 'sheet-overlay';
-    box.style.zIndex = 60;
-    box.innerHTML = `<div class="sheet"><div class="sheet-handle"></div><h2 style="margin:4px 0 8px;font-size:20px">${esc(title)}</h2><p class="muted" style="margin:0 0 16px">${text}</p>
-      <div class="btnrow"><button class="btn secondary" data-r="0">Abbrechen</button><button class="btn ${danger ? 'danger' : ''}" data-r="1">${esc(okLabel)}</button></div></div>`;
-    document.body.appendChild(box);
+    const box = overlay(`<div class="sheet"><div class="sheet-handle"></div><h2 style="margin:4px 0 8px;font-size:20px">${esc(title)}</h2><p class="muted" style="margin:0 0 16px">${text}</p>
+      <div class="btnrow"><button class="btn secondary" data-r="0">Abbrechen</button><button class="btn ${danger ? 'danger' : ''}" data-r="1">${esc(okLabel)}</button></div></div>`);
     box.addEventListener('click', (e) => {
       const b = e.target.closest('[data-r]');
       if (b || e.target === box) {
@@ -225,23 +272,18 @@ function ask(title, text, okLabel = 'OK', danger = false) {
         resolve(b ? b.dataset.r === '1' : false);
       }
     });
-    void prev;
   });
 }
 
 function askPassword(title, text, { confirm = false, okLabel = 'Weiter' } = {}) {
   return new Promise((resolve) => {
-    const box = document.createElement('div');
-    box.className = 'sheet-overlay';
-    box.style.zIndex = 60;
-    box.innerHTML = `<form class="sheet" autocomplete="on"><div class="sheet-handle"></div>
+    const box = overlay(`<form class="sheet" autocomplete="on"><div class="sheet-handle"></div>
       <h2 style="margin:4px 0 8px;font-size:20px">${esc(title)}</h2><p class="muted small" style="margin:0 0 6px">${text}</p>
       <input type="text" name="username" autocomplete="username" value="Budget-Backup" hidden readonly>
       <label class="field"><span>Passwort</span><input class="input" type="password" name="pw" autocomplete="${confirm ? 'new-password' : 'current-password'}" required minlength="${confirm ? 8 : 1}"></label>
       ${confirm ? '<label class="field"><span>Passwort wiederholen</span><input class="input" type="password" name="pw2" autocomplete="new-password" required></label>' : ''}
       <p class="small" data-err style="color:var(--minus);min-height:1em;margin:4px 2px"></p>
-      <div class="btnrow"><button type="button" class="btn secondary" data-r="0">Abbrechen</button><button type="submit" class="btn">${esc(okLabel)}</button></div></form>`;
-    document.body.appendChild(box);
+      <div class="btnrow"><button type="button" class="btn secondary" data-r="0">Abbrechen</button><button type="submit" class="btn">${esc(okLabel)}</button></div></form>`);
     const form = box.querySelector('form');
     setTimeout(() => form.pw.focus(), 50);
     const finish = (v) => { box.remove(); resolve(v); };
@@ -250,6 +292,7 @@ function askPassword(title, text, { confirm = false, okLabel = 'Weiter' } = {}) 
     });
     form.addEventListener('submit', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       const pw = form.pw.value;
       if (confirm) {
         if (pw.length < 8) { form.querySelector('[data-err]').textContent = 'Mindestens 8 Zeichen.'; return; }
@@ -257,6 +300,56 @@ function askPassword(title, text, { confirm = false, okLabel = 'Weiter' } = {}) 
       }
       finish(pw);
     });
+  });
+}
+
+// Neue Kategorie direkt aus einer Auswahlliste anlegen. Gibt die neue ID zurück.
+function askNewCategory() {
+  return new Promise((resolve) => {
+    const tops = GROUPS.map((g) => {
+      const cs = topCategories(S.categories, g.id);
+      return cs.length ? `<optgroup label="${esc(g.name)}">${cs.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}</optgroup>` : '';
+    }).join('');
+    const box = overlay(`<form class="sheet" autocomplete="off"><div class="sheet-handle"></div>
+      <h2 style="margin:4px 0 8px;font-size:20px">Neue Kategorie</h2>
+      <label class="field"><span>Name</span><input class="input" name="name" required placeholder="z.B. Dates, Fitness, Geschenke"></label>
+      <label class="field"><span>Gehört zu</span><select class="input" name="parentId"><option value="">— eigene Hauptkategorie —</option>${tops}</select></label>
+      <label class="field" data-groupfield><span>Gruppe</span><select class="input" name="group">${GROUPS.map((g) => `<option value="${g.id}"${g.id === 'alltag' ? ' selected' : ''}>${esc(g.name)}</option>`).join('')}</select></label>
+      <p class="small muted" style="margin:0 2px">Einen Betrag kannst du später im Plan festlegen. Unterkategorien teilen sich das Budget ihrer Hauptkategorie.</p>
+      <div class="btnrow"><button type="button" class="btn secondary" data-r="0">Abbrechen</button><button type="submit" class="btn">Anlegen</button></div></form>`);
+    const form = box.querySelector('form');
+    setTimeout(() => form.name.focus(), 50);
+    const toggle = () => { box.querySelector('[data-groupfield]').style.display = form.parentId.value ? 'none' : ''; };
+    form.parentId.addEventListener('change', toggle);
+    const finish = (v) => { box.remove(); resolve(v); };
+    box.addEventListener('click', (e) => {
+      if (e.target.closest('[data-r="0"]') || e.target === box) { e.stopPropagation(); finish(null); }
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const name = form.name.value.trim();
+      if (!name) return;
+      const parentId = form.parentId.value || null;
+      const cbi = catById();
+      const group = parentId ? cbi[parentId].group : form.group.value;
+      const siblings = parentId ? childCategories(S.categories, parentId) : S.categories.filter((c) => c.group === group && !c.parentId);
+      const order = siblings.length ? Math.max(...siblings.map((x) => x.order ?? 0)) + 1 : 0;
+      const c = { id: uid('cat'), name, group, parentId, order, early: false };
+      await db.put('categories', c);
+      S.categories.push(c);
+      finish(c.id);
+      toast(`Kategorie «${name}» angelegt.`);
+    });
+  });
+}
+
+function refreshCatSelects(target, newId) {
+  document.querySelectorAll('select[data-catsel]').forEach((s) => {
+    const v = s === target ? newId : s.value;
+    s.innerHTML = catOptions(v, s.dataset.none || undefined);
+    s.value = v;
+    s.dataset.prev = v;
   });
 }
 
@@ -272,7 +365,7 @@ function render() {
   }
   tabbar.hidden = false;
   renderTabbar();
-  const fn = { uebersicht: renderOverview, buchungen: renderTxs, rechnungen: renderInvoices, plan: renderPlan, mehr: renderMore }[S.tab];
+  const fn = { heute: renderToday, uebersicht: renderOverview, buchungen: renderTxs, rechnungen: renderInvoices, plan: renderPlan, mehr: renderMore }[S.tab] || renderToday;
   const { head, body } = fn();
   top.innerHTML = head;
   view.innerHTML = body;
@@ -283,21 +376,26 @@ function renderTabbar() {
   const unc = S.txs.filter((t) => !t.categoryId).length;
   const due = S.invoices.filter((i) => i.status === 'offen' && dueInfo(i).d <= 3).length;
   const tabs = [
-    ['uebersicht', 'Übersicht', ICON.home, 0],
+    ['heute', 'Heute', ICON.sun, due],
+    ['uebersicht', 'Monat', ICON.home, 0],
     ['buchungen', 'Buchungen', ICON.list, unc],
-    ['rechnungen', 'Rechnungen', ICON.bill, due],
     ['plan', 'Plan', ICON.plan, 0],
     ['mehr', 'Mehr', ICON.more, 0],
   ];
+  const active = S.tab === 'rechnungen' ? S.backTab : S.tab;
   tabbar.innerHTML = tabs.map(([id, label, icon, badge]) =>
-    `<button class="${S.tab === id ? 'on' : ''}" data-act="tab" data-tab="${id}">${icon}<span>${label}</span>${badge ? `<span class="dot">${badge}</span>` : ''}</button>`).join('');
+    `<button class="${active === id ? 'on' : ''}" data-act="tab" data-tab="${id}">${icon}<span>${label}</span>${badge ? `<span class="dot">${badge}</span>` : ''}</button>`).join('');
+}
+
+function installSteps() {
+  return 'Tippe in Safari auf die <b>drei Punkte</b> rechts neben der Adressleiste, dann <b>Teilen</b> und <b>Zum Home-Bildschirm</b>. «Als Web-App öffnen» eingeschaltet lassen.';
 }
 
 function renderWelcome() {
   return `<div class="welcome">
     <h1>Willkommen 👋</h1>
     <p>Deine Budget-App. Alles bleibt auf diesem Gerät, nichts geht ins Internet.</p>
-    ${isIOS && !isStandalone() ? notice({ ico: '📲', title: 'Zuerst auf den Homescreen legen', text: 'Tippe in Safari auf <b>Teilen</b> und dann auf <b>Zum Home-Bildschirm</b>. Öffne die App danach vom Homescreen und lade erst dort deine Startdatei. Die Homescreen-App hat ihren eigenen Speicher.' }) : ''}
+    ${isIOS && !isStandalone() ? notice({ ico: '📲', title: 'Zuerst auf den Homescreen legen', text: `${installSteps()} Öffne die App danach vom Homescreen und lade erst dort deine Startdatei. Die Homescreen-App hat ihren eigenen Speicher.` }) : ''}
     <div style="display:grid;gap:10px;margin-top:18px">
       <button class="btn block" data-act="data-load">Startdatei oder Backup laden</button>
       <button class="btn secondary block" data-act="start-empty">Leer beginnen</button>
@@ -305,7 +403,83 @@ function renderWelcome() {
   </div>`;
 }
 
-// ---------- Übersicht
+// ---------- Heute
+
+function renderToday() {
+  const today = todayISO();
+  const key = currentMonth();
+  const sums = summarizeUntil(key, data(), today);
+  const sm = sums.get(key);
+  const d = dailyOverview(sm, today);
+  const { lastBook } = importStatus(S.txs);
+  const manualSince = S.txs.filter((t) => t.source === 'manuell' && (!lastBook || t.date > lastBook)).length;
+  const dateText = new Date().toLocaleDateString('de-CH', { weekday: 'long', day: 'numeric', month: 'long' });
+
+  let stand;
+  if (!lastBook) stand = 'Noch kein Auszug importiert. Die Zahlen sind dein Plan.';
+  else if (lastBook < sm.range.start) stand = `Stand: Auszug bis ${fmtDate(lastBook)}. In diesem Monat ist noch nichts importiert, die Zahlen sind dein Plan.`;
+  else stand = `Stand: Auszug bis ${fmtDate(lastBook)}`;
+  if (manualSince) stand += ` · ${manualSince} ${manualSince === 1 ? 'Handeintrag' : 'Handeinträge'} seither`;
+
+  let notices = '';
+  if (isIOS && !isStandalone()) {
+    notices += notice({ ico: '📲', title: 'Auf den Homescreen legen', text: 'Sonst kann Safari deine Daten löschen, wenn du die Seite 7 Tage nicht öffnest.', actions: '<button class="btn small" data-act="help-install">So geht\'s</button>' });
+  }
+  notices += importHintHtml();
+
+  // Alltag: ca. pro Tag
+  let items = '';
+  for (const it of d.items) {
+    const used = it.plan > 0 ? Math.min(100, (it.actual / it.plan) * 100) : 0;
+    const over = it.left < 0;
+    const subs = (it.subs || []).filter((s) => s.actual !== 0)
+      .map((s) => `<div class="day-subline">davon ${esc(s.name)}: <span class="num">${chf(s.actual)}</span>${s.plan ? ` von ${chf(s.plan)}` : ''}</div>`).join('');
+    items += `<div class="day-item" data-act="cat-txs" data-id="${esc(it.id)}" data-month="${key}" role="button">
+      <div class="day-top"><span class="day-name">${esc(it.name)}</span>
+        <span class="day-big num ${over ? 'minus' : ''}">${over ? '0' : `ca. ${Math.round(it.perDay)}`} <small>CHF/Tag</small></span></div>
+      <div class="day-sub"><span>${over ? `<b class="minus">${chf(-it.left)} überzogen</b>` : `noch <b class="num">${chf(it.left)}</b> von ${chf(it.plan)}`}</span><span>bis ${fmtDateShort(d.end)}</span></div>
+      <div class="bar${over ? ' over' : ''}"><i style="width:${used.toFixed(1)}%"></i></div>
+      ${subs}
+    </div>`;
+  }
+  const alltag = d.items.length
+    ? `<div class="card"><div class="group-head"><h3>Alltag</h3><span class="sum">noch ${d.daysLeft} ${d.daysLeft === 1 ? 'Tag' : 'Tage'}</span></div>${items}</div>`
+    : notice({ ico: '🗓️', title: 'Kein Alltag-Budget geplant', text: 'Leg im Plan Beträge für Essen oder Freizeit an, dann siehst du hier, wie viel du pro Tag ausgeben kannst.' });
+
+  // Rechnungen
+  const open = S.invoices.filter((i) => i.status === 'offen').sort((a, b) => (a.due || '').localeCompare(b.due || ''));
+  const soon = open.filter((i) => dueInfo(i).d <= 14);
+  let inv = '';
+  if (soon.length) {
+    inv = `<div class="section-title">Rechnungen</div><div class="list">${soon.map((i) => {
+      const di = dueInfo(i);
+      return `<button class="row" data-act="inv-open" data-id="${esc(i.id)}"><div class="main"><div class="title">${esc(i.name)}</div><div class="sub"><span class="chip ${di.cls}">${esc(di.text)}</span></div></div><div class="right amount">${chf(i.amount)}</div></button>`;
+    }).join('')}<button class="row" data-act="open-invoices"><div class="main"><div class="title" style="color:var(--accent)">Alle Rechnungen (${open.length} offen)</div></div><span class="chev">›</span></button></div>`;
+  } else {
+    inv = `<div class="list"><button class="row" data-act="open-invoices"><div class="main"><div class="title">🧾 Rechnungen</div><div class="sub">${open.length ? `${open.length} offen, nichts in den nächsten 14 Tagen fällig` : 'Keine offenen Rechnungen'}</div></div><span class="chev">›</span></button></div>`;
+  }
+
+  const pd = nextPayday(today, S.settings.payday);
+  const payText = pd.days === 0 ? '🎉 Heute ist Zahltag' : `💰 Lohn in ${pd.days} ${pd.days === 1 ? 'Tag' : 'Tagen'} <span class="muted">(${fmtDateShort(pd.date)})</span>`;
+
+  const reminders = S.settings.remindersAdded ? '' : notice({ ico: '📅', kind: 'info', title: 'Erinnerungen in den Kalender', text: `Dein iPhone erinnert dich jeden Monat am ${MID_DAY}. an den Zwischenstand und am ${S.settings.payday}. an den Monatsabschluss.`, actions: '<button class="btn small" data-act="reminders">Eintragen</button>' });
+
+  const head = `<h1>Heute</h1><div class="today-date">${esc(dateText)}</div>`;
+  const body = `${notices}
+    <p class="stand">${stand}</p>
+    ${alltag}
+    <div class="btnrow" style="margin-top:4px"><button class="btn secondary" data-act="tx-new">+ Ausgabe eintragen</button></div>
+    ${inv}
+    <div class="list">
+      <div class="row" style="cursor:default"><div class="main"><div class="title">${payText}</div></div></div>
+      <button class="row" data-act="goto-month" data-month="${key}"><div class="main"><div class="title">Ende Monat übrig</div><div class="sub">${sm.resultKind === 'plan' ? 'laut Plan' : 'Prognose'} · ${esc(monthLabel(key))}</div></div><div class="right amount ${sm.result < 0 ? 'minus' : ''}">${chf(sm.result)}</div><span class="chev">›</span></button>
+    </div>
+    ${backupNotice()}
+    ${reminders}`;
+  return { head, body };
+}
+
+// ---------- Monat
 
 function renderOverview() {
   const today = todayISO();
@@ -325,24 +499,11 @@ function renderOverview() {
   const beforeStart = S.settings.startMonth && ymDiff(S.month, S.settings.startMonth) > 0;
 
   let notices = '';
-  if (isIOS && !isStandalone()) {
-    notices += notice({ ico: '📲', title: 'Auf den Homescreen legen', text: 'Sonst kann Safari deine Daten löschen, wenn du die Seite 7 Tage nicht öffnest.', actions: '<button class="btn small" data-act="help-install">So geht\'s</button>' });
-  }
   if (sm.noImport) {
-    notices += notice({ ico: '📄', title: `${monthName(S.month)} ist vorbei`, text: 'Lade den Kontoauszug vom ' + `${fmtDate(sm.range.start)} bis ${fmtDate(sm.range.end)} hoch.`, actions: '<button class="btn small" data-act="import-pdf">Auszug importieren</button>' });
+    notices += notice({ ico: '📄', title: `${monthName(S.month)} ist vorbei`, text: `Lade den Kontoauszug vom ${fmtDate(sm.range.start)} bis ${fmtDate(sm.range.end)} hoch.`, actions: '<button class="btn small" data-act="import-pdf">Auszug laden</button>' });
   }
   if (sm.uncategorized.count) {
     notices += notice({ ico: '🏷️', title: `${sm.uncategorized.count} ${sm.uncategorized.count === 1 ? 'Buchung' : 'Buchungen'} ohne Kategorie`, text: 'Ordne sie zu, damit die Zahlen stimmen. Die App merkt sich die Läden.', actions: '<button class="btn small" data-act="goto-unc">Zuordnen</button>' });
-  }
-  const dueSoon = S.invoices.filter((i) => i.status === 'offen' && dueInfo(i).d <= 7);
-  if (dueSoon.length) {
-    const sum = dueSoon.reduce((s, i) => s + i.amount, 0);
-    notices += notice({ ico: '🧾', kind: dueSoon.some((i) => dueInfo(i).d <= 0) ? 'red' : '', title: `${dueSoon.length} ${dueSoon.length === 1 ? 'Rechnung' : 'Rechnungen'} bald fällig (${chf(sum)})`, actions: '<button class="btn small" data-act="tab" data-tab="rechnungen">Ansehen</button>' });
-  }
-  const lb = S.settings.lastBackup;
-  const lbDays = lb ? daysBetween(lb.slice(0, 10), today) : null;
-  if (S.txs.length && (lbDays === null || lbDays > 30)) {
-    notices += notice({ ico: '💾', title: lb ? `Letztes Backup vor ${lbDays} Tagen` : 'Noch kein Backup', text: 'Deine Daten gibt es nur auf diesem Gerät. Ein Backup schützt vor Verlust.', actions: '<button class="btn small" data-act="backup">Backup erstellen</button>' });
   }
 
   const showActual = kind !== 'plan';
@@ -358,6 +519,10 @@ function renderOverview() {
         <div class="cat-row"><span class="cat-name">${esc(c.name)}</span><span class="cat-val num${c.over ? ' minus' : ''}">${val}</span></div>
         ${showActual ? `<div class="bar${c.over ? ' over' : ''}"><i style="width:${pct.toFixed(1)}%"></i></div>` : ''}
       </div>`;
+      for (const s of c.subs || []) {
+        const sv = showActual ? `${chf(s.actual)}${s.plan ? ` <span class="of">/ ${chf(s.plan)}</span>` : ''}` : (s.plan ? chf(s.plan) : '');
+        groupsHtml += `<div class="cat sub" data-act="cat-txs" data-id="${esc(s.id)}" role="button"><div class="cat-row"><span class="cat-name">↳ ${esc(s.name)}</span><span class="cat-val num${s.over ? ' minus' : ''}">${sv}</span></div></div>`;
+      }
     }
     groupsHtml += '</div>';
   }
@@ -366,7 +531,6 @@ function renderOverview() {
   }
   if (!groupsHtml) groupsHtml = '<div class="empty"><div class="big">🗓️</div>Für diesen Monat ist noch nichts geplant.</div>';
 
-  // Lebensmittel
   let foodHtml = '';
   const fs = foodStats(data(), today, brandOf);
   if (fs && fs.months.length) {
@@ -414,8 +578,9 @@ function renderTxs() {
   if (S.txFilter === 'ohne') list = unc;
   else if (S.txFilter.startsWith('cat:')) {
     const id = S.txFilter.slice(4);
-    list = all.filter((t) => t.categoryId === id);
-    filterChip = `<button class="on" data-act="tx-filter" data-f="alle">${esc(cbi[id]?.name || 'Kategorie')} ✕</button>`;
+    const ids = idsWithChildren(id);
+    list = all.filter((t) => ids.includes(t.categoryId));
+    filterChip = `<button class="on" data-act="tx-filter" data-f="alle">${esc(catLabel(cbi[id], cbi) || 'Kategorie')} ✕</button>`;
   }
   list = [...list].sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.bookDate || '').localeCompare(a.bookDate || ''));
   const out = round2(list.filter((t) => t.amount < 0).reduce((s, t) => s - t.amount, 0));
@@ -433,7 +598,7 @@ function renderTxs() {
     }
     const cat = t.categoryId ? cbi[t.categoryId] : null;
     const nRec = receiptsOf('tx', t.id).length + (t.invoiceId ? receiptsOf('invoice', t.invoiceId).length : 0);
-    const bits = [cat ? esc(cat.name) : '<span class="need">Kategorie wählen</span>'];
+    const bits = [cat ? esc(catLabel(cat, cbi)) : '<span class="need">Kategorie wählen</span>'];
     if (nRec) bits.push(`📎 ${nRec}`);
     if (t.source === 'manuell') bits.push(esc(t.paidWith || 'von Hand'));
     if (t.month) bits.push('verschoben');
@@ -445,9 +610,10 @@ function renderTxs() {
   }
   flush();
   if (!list.length) {
+    const r = monthRange(S.month, S.settings.payday);
     rows = all.length
       ? '<div class="empty">Keine Buchungen für diesen Filter.</div>'
-      : `<div class="empty"><div class="big">📄</div>Noch keine Buchungen in diesem Monat.<br>Ende Monat: Auszug vom ${fmtDate(monthRange(S.month, S.settings.payday).start)} bis ${fmtDate(monthRange(S.month, S.settings.payday).end)} importieren.</div>`;
+      : `<div class="empty"><div class="big">📄</div>Noch keine Buchungen in diesem Monat.<br>Lade den Auszug vom ${fmtDate(r.start)} bis ${fmtDate(r.end)} hoch, gern auch schon zwischendurch.</div>`;
   }
 
   const head = monthbar(S.month);
@@ -455,6 +621,7 @@ function renderTxs() {
       <button class="btn" data-act="import-pdf">Auszug laden</button>
       <button class="btn secondary" data-act="tx-new">+ Eintrag</button>
     </div>
+    ${importHintHtml(true)}
     <div class="chips">
       <button class="${S.txFilter === 'alle' ? 'on' : ''}" data-act="tx-filter" data-f="alle">Alle (${all.length})</button>
       <button class="${S.txFilter === 'ohne' ? 'on' : ''}" data-act="tx-filter" data-f="ohne">Ohne Kategorie (${unc.length})</button>
@@ -476,14 +643,15 @@ function renderInvoices() {
     const di = dueInfo(i);
     const cat = i.categoryId ? cbi[i.categoryId] : null;
     const sub = i.status === 'offen'
-      ? `${cat ? esc(cat.name) + ' · ' : ''}zählt zum ${esc(monthName(invoiceMonth(i, S.settings)))}${receiptsOf('invoice', i.id).length ? ' · 📎' : ''}`
+      ? `${cat ? esc(catLabel(cat, cbi)) + ' · ' : ''}zählt zum ${esc(monthName(invoiceMonth(i, S.settings)))}${receiptsOf('invoice', i.id).length ? ' · 📎' : ''}`
       : `bezahlt ${fmtDate(i.paidDate)}${i.paidTxId ? ' · im Import gefunden' : ''}`;
     return `<button class="row" data-act="inv-open" data-id="${esc(i.id)}">
       <div class="main"><div class="title">${esc(i.name)}</div><div class="sub">${sub}</div></div>
       <div class="right"><div class="amount">${chf(i.amount)}</div>${i.status === 'offen' ? `<span class="chip ${di.cls}">${esc(di.text)}</span>` : ''}</div>
     </button>`;
   };
-  const head = '<h1>Rechnungen</h1>';
+  const backLabel = { heute: 'Heute', mehr: 'Mehr', uebersicht: 'Monat', buchungen: 'Buchungen', plan: 'Plan' }[S.backTab] || 'Heute';
+  const head = `<button class="btn ghost small backbtn" data-act="tab" data-tab="${S.backTab}">‹ ${backLabel}</button><h1>Rechnungen</h1>`;
   const body = `
     <button class="btn block" data-act="inv-new" style="margin-top:6px">+ Rechnung erfassen</button>
     <p class="small muted" style="margin:10px 4px">Offene Rechnungen zählen sofort in deinem Budget. Beim Import findet die App die Zahlung und hakt sie automatisch ab.</p>
@@ -495,23 +663,29 @@ function renderInvoices() {
 
 // ---------- Plan
 
+function planRow(c, isSub) {
+  const amt = isSub ? planForCategory(S.plan, c.id, S.month) : planForTree(S.plan, S.categories, c.id, S.month);
+  const entries = S.plan.filter((e) => e.categoryId === c.id);
+  const kids = isSub ? [] : childCategories(S.categories, c.id);
+  let sub = entries.length ? entries.map(entrySummary).join('<br>') : (kids.length ? 'Budget über die Unterkategorien' : 'Kein Betrag geplant');
+  if (isSub && !entries.length) sub = 'teilt das Budget der Hauptkategorie';
+  const flags = [c.id === S.settings.foodCategoryId ? '🛒' : '', c.early ? '📅' : ''].join('');
+  return `<button class="row${isSub ? ' subrow' : ''}" data-act="cat-open" data-id="${esc(c.id)}">
+    <div class="main"><div class="title">${isSub ? '↳ ' : ''}${esc(c.name)} ${flags}</div><div class="sub" style="white-space:normal">${sub}</div></div>
+    <div class="right amount ${amt ? '' : 'muted'}">${amt ? chf(amt) : '–'}</div>
+  </button>`;
+}
+
 function renderPlan() {
   let planIn = 0, planOut = 0;
-  let html = `<p class="small muted" style="margin:6px 4px 0">Beträge im ${esc(monthLabel(S.month))}. Tippe auf eine Kategorie, um den Plan zu ändern.</p>`;
+  let html = `<p class="small muted" style="margin:6px 4px 0">Beträge im ${esc(monthLabel(S.month))}. Tippe auf eine Kategorie, um sie zu bearbeiten.</p>`;
   for (const g of GROUPS) {
-    const cats = sortedCategories(S.categories, g.id);
     let gsum = 0;
     let rows = '';
-    for (const c of cats) {
-      const amt = planForCategory(S.plan, c.id, S.month);
-      gsum += amt;
-      const entries = S.plan.filter((e) => e.categoryId === c.id);
-      const sub = entries.length ? entries.map(entrySummary).join('<br>') : 'Kein Betrag geplant';
-      const flags = [c.id === S.settings.foodCategoryId ? '🛒' : '', c.early ? '📅' : ''].join('');
-      rows += `<button class="row" data-act="cat-open" data-id="${esc(c.id)}">
-        <div class="main"><div class="title">${esc(c.name)} ${flags}</div><div class="sub" style="white-space:normal">${sub}</div></div>
-        <div class="right amount ${amt ? '' : 'muted'}">${amt ? chf(amt) : '–'}</div>
-      </button>`;
+    for (const c of topCategories(S.categories, g.id)) {
+      gsum += planForTree(S.plan, S.categories, c.id, S.month);
+      rows += planRow(c, false);
+      for (const s of childCategories(S.categories, c.id)) rows += planRow(s, true);
     }
     if (g.income) planIn += gsum; else planOut += gsum;
     html += `<div class="section-title" style="display:flex;justify-content:space-between"><span>${esc(g.name)}</span><span class="num">${chf(gsum)}</span></div>
@@ -522,9 +696,9 @@ function renderPlan() {
     <div class="kv"><span class="k">Geplante Einnahmen</span><span class="num">${chf(planIn)}</span></div>
     <div class="kv"><span class="k">Geplante Ausgaben</span><span class="num">${chf(-planOut, { sign: true })}</span></div>
     <div class="kv total"><span>Im ${esc(monthName(S.month))} geplant übrig</span><span class="num ${diff < 0 ? 'minus' : 'plus'}">${chf(diff, { sign: true })}</span></div>
-    <p class="small muted" style="margin:6px 0 0">Ohne Übertrag aus dem Vormonat. Den siehst du in der Übersicht.</p>
+    <p class="small muted" style="margin:6px 0 0">Ohne Übertrag aus dem Vormonat. Den siehst du unter «Monat».</p>
   </div>
-  <p class="tiny muted" style="margin:4px">🛒 = Lebensmittel-Auswertung · 📅 = kommt um den Zahltag (Lohn, Miete)</p>`;
+  <p class="tiny muted" style="margin:4px">🛒 = Lebensmittel-Auswertung · 📅 = kommt um den Zahltag (Lohn, Miete) · ↳ = Unterkategorie</p>`;
   return { head: monthbar(S.month), body: html };
 }
 
@@ -532,13 +706,20 @@ function renderPlan() {
 
 function renderMore() {
   const lb = S.settings.lastBackup;
+  const open = S.invoices.filter((i) => i.status === 'offen').length;
   const head = '<h1>Mehr</h1>';
   const r = (act, title, sub = '', extra = '') => `<button class="row" data-act="${act}" ${extra}><div class="main"><div class="title">${title}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div><span class="chev">›</span></button>`;
   const body = `
-    <div class="section-title">Auswertung</div>
-    <div class="list">${r('food', '🛒 Lebensmittel', 'Durchschnitt pro Monat und nach Laden')}</div>
+    <div class="section-title">Geld</div>
+    <div class="list">
+      ${r('open-invoices', '🧾 Rechnungen', open ? `${open} offen` : 'Keine offenen')}
+      ${r('food', '🛒 Lebensmittel', 'Durchschnitt pro Monat und nach Laden')}
+    </div>
     <div class="section-title">Kontoauszug</div>
-    <div class="list">${r('import-pdf', '📄 Auszug importieren (PDF)', 'LUKB E-Banking → Vermögen → Kontoauszug → Exportieren')}</div>
+    <div class="list">
+      ${r('import-pdf', '📄 Auszug laden (PDF)', 'LUKB E-Banking → Vermögen → Kontoauszug → Exportieren')}
+      ${r('reminders', '📅 Erinnerungen in den Kalender', `Jeden Monat am ${MID_DAY}. und ${S.settings.payday}.${S.settings.remindersAdded ? ' · eingetragen ✓' : ''}`)}
+    </div>
     <div class="section-title">Daten & Backup</div>
     <div class="list">
       ${r('backup', '💾 Backup erstellen', lb ? `Letztes Backup: ${fmtDate(lb.slice(0, 10))}` : 'Noch nie')}
@@ -546,6 +727,7 @@ function renderMore() {
     </div>
     <div class="section-title">Einstellungen</div>
     <div class="list">
+      ${r('tab', '🗂️ Kategorien & Plan', 'Anlegen, umbenennen, Unterkategorien, zusammenführen', 'data-tab="plan"')}
       ${r('settings', '⚙️ Budgetmonat & Übertrag', `Zahltag am ${S.settings.payday}. · Start ${S.settings.startMonth ? monthLabel(S.settings.startMonth) : '–'}`)}
       ${r('rules', '🏪 Gelernte Läden', `${S.rules.length} gemerkt`)}
     </div>
@@ -623,6 +805,7 @@ function openTxForm(t, isNew) {
   const cbi = catById();
   const autoMonth = txMonth({ ...t, month: null }, S.settings, cbi);
   const hasRule = t.merchant && S.rules.find((r) => r.key === merchantKey(t.merchant));
+  const twint = /twint/i.test(t.type || '');
   const inv = t.invoiceId ? S.invoices.find((i) => i.id === t.invoiceId) : null;
   const html = `${sheetHead(isNew ? 'Neuer Eintrag' : (t.merchant || 'Buchung'))}
     <form data-form="tx" autocomplete="off">
@@ -635,10 +818,11 @@ function openTxForm(t, isNew) {
         <div class="grid2">
           <label class="field"><span>Datum</span><input class="input" type="date" name="date" value="${esc(t.date || todayISO())}" required></label>
           <label class="field"><span>Bezahlt mit</span><select class="input" name="paidWith">
-            ${['Kreditkarte', 'Bar', 'Twint', 'Debitkarte', 'Anderes'].map((p) => `<option${(t.paidWith || 'Kreditkarte') === p ? ' selected' : ''}>${p}</option>`).join('')}
+            ${['Kreditkarte', 'Debitkarte', 'Twint', 'Bar', 'Anderes'].map((p) => `<option${(t.paidWith || 'Kreditkarte') === p ? ' selected' : ''}>${p}</option>`).join('')}
           </select></label>
         </div>
         <label class="field"><span>Bezeichnung</span><input class="input" name="merchant" value="${esc(t.merchant || '')}" placeholder="z.B. Restaurant, Laden"></label>
+        ${isNew ? '<p class="small muted" style="margin:-4px 2px 6px">Mit Debitkarte oder Twint bezahlt? Beim nächsten Import wird der Eintrag mit dem Auszug abgeglichen und zählt nicht doppelt.</p>' : ''}
       ` : `
         <div class="card card-pad" style="margin-top:4px">
           <div class="big num ${t.amount > 0 ? 'plus' : ''}" style="font-size:30px;font-weight:700">${chf(t.amount, { sign: true })}</div>
@@ -646,8 +830,8 @@ function openTxForm(t, isNew) {
           <div class="lines">${(t.lines || [t.text]).map(esc).join('<br>')}</div>
         </div>
       `}
-      <label class="field"><span>Kategorie</span><select class="input" name="categoryId">${catOptions(t.categoryId)}</select></label>
-      ${(!manual && t.merchant) ? `<label class="check"><input type="checkbox" name="learn" ${hasRule ? '' : 'checked'}><span>Für «${esc(t.merchant || '')}» merken${hasRule ? ` <span class="muted small">(gemerkt: ${esc(cbi[hasRule.categoryId]?.name || '?')})</span>` : ''}</span></label>` : ''}
+      <label class="field"><span>Kategorie</span>${catSelect('categoryId', t.categoryId)}</label>
+      ${(!manual && t.merchant) ? `<label class="check"><input type="checkbox" name="learn" ${hasRule || twint ? '' : 'checked'}><span>Für «${esc(t.merchant || '')}» merken${hasRule ? ` <span class="muted small">(gemerkt: ${esc(catLabel(cbi[hasRule.categoryId], cbi) || '?')})</span>` : ''}${twint && !hasRule ? ' <span class="muted small">(TWINT von Personen besser nicht)</span>' : ''}</span></label>` : ''}
       <label class="field"><span>Monat</span><select class="input" name="month">${monthOptions(t.month || '', { emptyLabel: `Automatisch (${monthLabel(autoMonth)})` })}</select></label>
       <label class="field"><span>Notiz</span><textarea class="input" name="note" rows="2">${esc(t.note || '')}</textarea></label>
       <div class="field"><span>Belege</span>__RECEIPTS__</div>
@@ -665,7 +849,7 @@ function openTxForm(t, isNew) {
 async function saveTx(form) {
   const { tx, isNew, ownerId } = SH;
   const f = form.elements;
-  const categoryId = f.categoryId.value || null;
+  const categoryId = f.categoryId.value && f.categoryId.value !== '__new' ? f.categoryId.value : null;
   const month = f.month.value || null;
   const note = f.note.value.trim();
   let t;
@@ -739,7 +923,7 @@ function openInvoiceForm(inv, isNew) {
         <label class="field"><span>Betrag (CHF)</span><input class="input" name="amount" inputmode="decimal" value="${i.amount !== '' ? esc(Number(i.amount).toFixed(2)) : ''}" placeholder="0.00" required></label>
         <label class="field"><span>Fällig am</span><input class="input" type="date" name="due" value="${esc(i.due)}" required></label>
       </div>
-      <label class="field"><span>Kategorie</span><select class="input" name="categoryId">${catOptions(i.categoryId)}</select></label>
+      <label class="field"><span>Kategorie</span>${catSelect('categoryId', i.categoryId)}</label>
       <label class="field"><span>Zählt zum Monat (automatisch nach Fälligkeit)</span><select class="input" name="month">${monthOptions(i.month || '', { emptyLabel: `Automatisch (${monthLabel(autoMonth)})` })}</select></label>
       <label class="field"><span>Notiz</span><textarea class="input" name="note" rows="2">${esc(i.note || '')}</textarea></label>
       <div class="field"><span>Rechnung / Beleg</span>__RECEIPTS__</div>
@@ -761,9 +945,10 @@ async function saveInvoice(form) {
   const amount = parseAmount(f.amount.value);
   if (!(amount > 0)) { toast('Bitte einen Betrag eingeben.'); return; }
   const name = f.name.value.trim() || 'Rechnung';
+  const catId = f.categoryId.value && f.categoryId.value !== '__new' ? f.categoryId.value : null;
   const rec = {
     ...(isNew ? { id: ownerId, status: 'offen', created: todayISO() } : inv),
-    name, amount, due: f.due.value, categoryId: f.categoryId.value || null, month: f.month.value || null, note: f.note.value.trim(),
+    name, amount, due: f.due.value, categoryId: catId, month: f.month.value || null, note: f.note.value.trim(),
   };
   const ops = [{ store: 'invoices', type: 'put', value: rec }];
   for (const p of SH.pending) {
@@ -785,6 +970,7 @@ async function saveInvoice(form) {
 
 function entryEditor(entries) {
   return entries.map((e, i) => `<div class="entry" data-i="${i}">
+    <label class="field"><span>Bezeichnung (optional)</span><input class="input" data-k="label" value="${esc(e.label || '')}" placeholder="z.B. Steuern 2026, Raten, Geburtstag Anna"></label>
     <div class="grid2">
       <label class="field"><span>Betrag (CHF)</span><input class="input" data-k="amount" inputmode="decimal" value="${e.amount !== '' && e.amount != null ? esc(Number(e.amount).toFixed(2)) : ''}" placeholder="0.00"></label>
       <label class="field"><span>Rhythmus</span><select class="input" data-k="every">${RHYTHMS.map((r) => `<option value="${r.every}"${Number(e.every) === r.every ? ' selected' : ''}>${r.label}</option>`).join('')}</select></label>
@@ -803,7 +989,10 @@ function readEntries() {
     const i = Number(el.dataset.i);
     const old = SH.entries[i] || {};
     const g = (k) => el.querySelector(`[data-k="${k}"]`).value;
-    out.push({ ...old, amount: g('amount') === '' ? '' : parseAmount(g('amount')), every: Number(g('every')), start: g('start'), end: g('end') || null });
+    out.push({
+      ...old, label: g('label').trim(), amount: g('amount') === '' ? '' : parseAmount(g('amount')),
+      every: Number(g('every')), start: g('start'), end: g('end') || null,
+    });
   });
   return out;
 }
@@ -814,24 +1003,38 @@ function refreshEntries() {
 
 function openCategory(id, groupId) {
   const isNew = !id;
-  const c = isNew ? { id: uid('cat'), name: '', group: groupId || 'alltag', order: 999, early: false } : S.categories.find((x) => x.id === id);
+  const cbi = catById();
+  const c = isNew ? { id: uid('cat'), name: '', group: groupId || 'alltag', order: 999, early: false, parentId: null } : cbi[id];
+  if (!c) return;
+  const kids = isNew ? [] : childCategories(S.categories, c.id);
+  const parent = parentOf(c, cbi);
   const entries = S.plan.filter((e) => e.categoryId === c.id).map((e) => ({ ...e }));
-  if (isNew) entries.push({ id: null, amount: '', every: 1, start: S.month, end: null });
+  if (isNew) entries.push({ id: null, label: '', amount: '', every: 1, start: S.month, end: null });
+  const parentOptions = GROUPS.map((g) => {
+    const cs = topCategories(S.categories, g.id).filter((x) => x.id !== c.id);
+    return cs.length ? `<optgroup label="${esc(g.name)}">${cs.map((x) => `<option value="${esc(x.id)}"${parent && parent.id === x.id ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</optgroup>` : '';
+  }).join('');
+  const usedTx = isNew ? 0 : S.txs.filter((t) => t.categoryId === c.id).length;
   const html = `${sheetHead(isNew ? 'Neue Kategorie' : c.name)}
     <form data-form="cat" autocomplete="off">
-      <label class="field"><span>Name</span><input class="input" name="name" value="${esc(c.name)}" required placeholder="z.B. Fitness"></label>
-      <label class="field"><span>Gruppe</span><select class="input" name="group">${GROUPS.map((g) => `<option value="${g.id}"${g.id === c.group ? ' selected' : ''}>${esc(g.name)}</option>`).join('')}</select></label>
+      <label class="field"><span>Name</span><input class="input" name="name" value="${esc(c.name)}" required placeholder="z.B. Steuern, Geschenke, Dates"></label>
+      <label class="field"><span>Gehört zu</span><select class="input" name="parentId" data-change="cat-parent" ${kids.length ? 'disabled' : ''}>
+        <option value="">— eigene Hauptkategorie —</option>${parentOptions}</select></label>
+      ${kids.length ? `<p class="small muted" style="margin:-6px 2px 8px">Hat Unterkategorien (${kids.map((k) => esc(k.name)).join(', ')}) und bleibt darum eine Hauptkategorie.</p>` : ''}
+      <label class="field" data-groupfield ${parent ? 'style="display:none"' : ''}><span>Gruppe</span><select class="input" name="group">${GROUPS.map((g) => `<option value="${g.id}"${g.id === c.group ? ' selected' : ''}>${esc(g.name)}</option>`).join('')}</select></label>
       <div class="section-title">Geplante Beträge</div>
       <div id="entries">${entryEditor(entries)}</div>
       <button type="button" class="btn secondary block" data-act="entry-add">+ Betrag hinzufügen</button>
-      <p class="small muted" style="margin:8px 2px">Für Änderungen ab einem Monat (z.B. Lohnerhöhung): beim alten Betrag ein «Bis» setzen und einen neuen Betrag hinzufügen.</p>
+      <p class="small muted" style="margin:8px 2px">Einmalige Sachen (z.B. Steuern 2026) als beschrifteten Betrag in einer festen Kategorie wie «Steuern» erfassen. Unterkategorien ohne eigenen Betrag teilen sich das Budget der Hauptkategorie.</p>
       <div class="section-title">Optionen</div>
       <label class="check"><input type="checkbox" name="food" ${S.settings.foodCategoryId === c.id ? 'checked' : ''}><span>🛒 Für die Lebensmittel-Auswertung verwenden<br><span class="small muted">Läden wie Migros, Coop, Denner, Lidl landen automatisch hier.</span></span></label>
       <label class="check"><input type="checkbox" name="early" ${c.early ? 'checked' : ''}><span>📅 Kommt um den Zahltag (Lohn, Miete)<br><span class="small muted">Zählt schon ab dem ${S.settings.earlyFrom}. zum nächsten Monat, falls der ${S.settings.payday}. auf ein Wochenende fällt.</span></span></label>
-      <div class="btnrow">
-        ${isNew ? '' : '<button type="button" class="btn danger" data-act="cat-delete">Löschen</button>'}
-        <button type="submit" class="btn">Speichern</button>
+      <div class="btnrow"><button type="submit" class="btn">Speichern</button></div>
+      ${isNew ? '' : `<div class="btnrow">
+        <button type="button" class="btn secondary" data-act="cat-merge">Zusammenführen …</button>
+        <button type="button" class="btn danger" data-act="cat-delete">Löschen</button>
       </div>
+      <p class="small muted" style="margin:0 2px">${usedTx} ${usedTx === 1 ? 'Buchung' : 'Buchungen'} in dieser Kategorie.</p>`}
     </form>`;
   openSheet(html, { kind: 'cat', cat: c, isNew, entries });
 }
@@ -845,18 +1048,24 @@ async function saveCategory(form) {
   for (const e of entries) {
     if (e.end && ymDiff(e.start, e.end) < 0) { toast('«Bis» liegt vor «Ab». Bitte prüfen.'); return; }
   }
+  const cbi = catById();
+  const parentId = f.parentId.disabled ? null : (f.parentId.value || null);
+  const group = parentId ? cbi[parentId].group : f.group.value;
   let order = cat.order;
-  if (isNew || cat.group !== f.group.value) {
-    const same = S.categories.filter((x) => x.group === f.group.value && x.id !== cat.id);
-    order = same.length ? Math.max(...same.map((x) => x.order ?? 0)) + 1 : 0;
+  if (isNew || cat.group !== group || (cat.parentId || null) !== parentId) {
+    const sib = parentId ? childCategories(S.categories, parentId) : S.categories.filter((x) => x.group === group && !x.parentId);
+    const others = sib.filter((x) => x.id !== cat.id);
+    order = others.length ? Math.max(...others.map((x) => x.order ?? 0)) + 1 : 0;
   }
-  const c = { ...cat, name, group: f.group.value, early: f.early.checked, order };
+  const c = { ...cat, name, group, parentId, early: f.early.checked, order };
   const ops = [{ store: 'categories', type: 'put', value: c }];
+  // Unterkategorien wandern mit, wenn die Gruppe der Hauptkategorie ändert
+  for (const k of childCategories(S.categories, c.id)) if (k.group !== group) ops.push({ store: 'categories', type: 'put', value: { ...k, group } });
   const keep = new Set();
   for (const e of entries) {
-    const id = e.id || uid('p');
-    keep.add(id);
-    ops.push({ store: 'plan', type: 'put', value: { id, categoryId: c.id, amount: round2(e.amount), every: Number(e.every), start: e.start, end: Number(e.every) === 0 ? null : (e.end || null) } });
+    const eid = e.id || uid('p');
+    keep.add(eid);
+    ops.push({ store: 'plan', type: 'put', value: { id: eid, categoryId: c.id, label: e.label || '', amount: round2(e.amount), every: Number(e.every), start: e.start, end: Number(e.every) === 0 ? null : (e.end || null) } });
   }
   for (const old of S.plan.filter((p) => p.categoryId === c.id)) if (!keep.has(old.id)) ops.push({ store: 'plan', type: 'del', key: old.id });
   await db.batch(ops);
@@ -865,25 +1074,59 @@ async function saveCategory(form) {
   await load();
   closeSheet();
   render();
-  toast('Plan gespeichert.');
+  toast('Gespeichert.');
 }
 
 async function deleteCategory() {
   const { cat } = SH;
   const used = S.txs.filter((t) => t.categoryId === cat.id).length + S.invoices.filter((i) => i.categoryId === cat.id).length;
-  const msg = used ? `${used} Buchungen/Rechnungen verlieren ihre Kategorie. Der Plan dieser Kategorie wird gelöscht.` : 'Der Plan dieser Kategorie wird gelöscht.';
+  const kids = childCategories(S.categories, cat.id);
+  let msg = used ? `${used} Buchungen/Rechnungen verlieren ihre Kategorie. Der Plan dieser Kategorie wird gelöscht.` : 'Der Plan dieser Kategorie wird gelöscht.';
+  if (kids.length) msg += ` Die Unterkategorien (${kids.map((k) => esc(k.name)).join(', ')}) werden zu Hauptkategorien.`;
+  msg += ' Tipp: Mit «Zusammenführen» bleiben Buchungen und Beträge erhalten.';
   if (!(await ask(`«${esc(cat.name)}» löschen?`, msg, 'Löschen', true))) return;
   const ops = [{ store: 'categories', type: 'del', key: cat.id }];
   for (const p of S.plan.filter((x) => x.categoryId === cat.id)) ops.push({ store: 'plan', type: 'del', key: p.id });
   for (const t of S.txs.filter((x) => x.categoryId === cat.id)) ops.push({ store: 'txs', type: 'put', value: { ...t, categoryId: null } });
   for (const i of S.invoices.filter((x) => x.categoryId === cat.id)) ops.push({ store: 'invoices', type: 'put', value: { ...i, categoryId: null } });
   for (const r of S.rules.filter((x) => x.categoryId === cat.id)) ops.push({ store: 'rules', type: 'del', key: r.key });
+  for (const k of kids) ops.push({ store: 'categories', type: 'put', value: { ...k, parentId: null } });
   await db.batch(ops);
   if (S.settings.foodCategoryId === cat.id) await saveSettings({ foodCategoryId: null });
   await load();
   closeSheet();
   render();
   toast('Kategorie gelöscht.');
+}
+
+function openMerge() {
+  const { cat } = SH;
+  const exclude = idsWithChildren(cat.id);
+  const nPlan = S.plan.filter((e) => e.categoryId === cat.id).length;
+  const nTx = S.txs.filter((t) => t.categoryId === cat.id).length;
+  const nInv = S.invoices.filter((i) => i.categoryId === cat.id).length;
+  const html = `${sheetHead(`«${cat.name}» zusammenführen`)}
+    <form data-form="merge">
+      <p class="small muted" style="margin:0 2px 8px">Alles aus «${esc(cat.name)}» wandert in die Kategorie, die du hier wählst: ${nPlan} ${nPlan === 1 ? 'Betrag' : 'Beträge'} (mit Bezeichnung «${esc(cat.name)}»), ${nTx} Buchungen${nInv ? `, ${nInv} Rechnungen` : ''} und gelernte Läden. Danach wird «${esc(cat.name)}» gelöscht.</p>
+      <label class="field"><span>Zusammenführen mit</span><select class="input" name="target" required>${catOptions(null, '— Kategorie wählen —', { allowNew: false, exclude })}</select></label>
+      <p class="small muted" style="margin:0 2px">Beispiel: «Steuern 2025» mit «Steuern» zusammenführen. Im Plan steht dann bei «Steuern» der Betrag «Steuern 2025 · 900 im Dez».</p>
+      <div class="btnrow"><button type="button" class="btn secondary" data-act="cat-open" data-id="${esc(cat.id)}">Zurück</button><button type="submit" class="btn">Zusammenführen</button></div>
+    </form>`;
+  openSheet(html, { kind: 'merge', cat });
+}
+
+async function doMerge(form) {
+  const { cat } = SH;
+  const target = form.elements.target.value;
+  if (!target) { toast('Bitte eine Kategorie wählen.'); return; }
+  const { ops, counts, settingsPatch } = mergeCategoryOps(data(), cat.id, target);
+  await db.batch(ops);
+  if (settingsPatch) await saveSettings(settingsPatch);
+  const toName = catLabel(catById()[target]);
+  await load();
+  closeSheet();
+  render();
+  toast(`Zusammengeführt in «${toName}»: ${counts.plan} ${counts.plan === 1 ? 'Betrag' : 'Beträge'}, ${counts.txs} ${counts.txs === 1 ? 'Buchung' : 'Buchungen'}.`);
 }
 
 // ---------------------------------------------------------------- Import
@@ -919,7 +1162,7 @@ function impRow(f, i) {
   return `<div class="imp-row ${f.categoryId ? '' : 'need'}" data-i="${i}">
     <div class="imp-top"><span class="m">${esc(f.merchant || f.type)}</span><span class="amount ${f.amount > 0 ? 'plus' : ''}">${chf(f.amount, { sign: true })}</span></div>
     <div class="meta">${meta.join(' · ')}</div>
-    <select class="input" data-change="imp-cat" data-i="${i}">${catOptions(f.categoryId, '— Kategorie wählen —')}</select>
+    ${catSelect('', f.categoryId, { noneLabel: '— Kategorie wählen —', attrs: `data-change="imp-cat" data-i="${i}"` })}
     ${learnable ? `<label class="check small" style="margin:6px 2px 0"><input type="checkbox" data-change="imp-learn" data-i="${i}" ${f.learn ? 'checked' : ''}><span>Laden merken</span></label>` : ''}
   </div>`;
 }
@@ -946,7 +1189,7 @@ function openImport(ctx) {
     ${prep.matchedManual ? notice({ ico: '🔗', kind: 'info', title: `${prep.matchedManual} ${prep.matchedManual === 1 ? 'Handeintrag' : 'Handeinträge'} abgeglichen`, text: 'Diese zählen nicht doppelt. Notizen und Belege werden übernommen.' }) : ''}
     ${prep.matchedInvoices ? notice({ ico: '🧾', kind: 'info', title: `${prep.matchedInvoices} ${prep.matchedInvoices === 1 ? 'Rechnung' : 'Rechnungen'} als bezahlt erkannt` }) : ''}
     ${!fresh.length ? '<div class="empty"><div class="big">👍</div>Nichts Neues. Dieser Auszug ist schon importiert.</div><button class="btn block" data-act="sheet-close">Schliessen</button>' : `
-      ${need.length ? `<div class="section-title">Bitte zuordnen (${need.length})</div><p class="small muted" style="margin:0 4px 6px">Was du hier zuordnest, merkt sich die App für das nächste Mal.</p><div class="list">${need.map(([f, i]) => impRow(f, i)).join('')}</div>` : ''}
+      ${need.length ? `<div class="section-title">Bitte zuordnen (${need.length})</div><p class="small muted" style="margin:0 4px 6px">Was du hier zuordnest, merkt sich die App für das nächste Mal. TWINT von Personen merkt sie sich nicht automatisch.</p><div class="list">${need.map(([f, i]) => impRow(f, i)).join('')}</div>` : ''}
       ${auto.length ? `<div class="section-title">Automatisch zugeordnet (${auto.length})</div><div class="list">${auto.map(([f, i]) => impRow(f, i)).join('')}</div>` : ''}
       <div class="btnrow" style="position:sticky;bottom:0;background:var(--bg);padding:10px 0 4px;margin-bottom:0">
         <button class="btn secondary" data-act="sheet-close">Abbrechen</button>
@@ -1011,7 +1254,7 @@ function openFood() {
   const cbi = catById();
   let html = sheetHead('Lebensmittel');
   if (!fs) {
-    html += `<div class="empty">Noch keine Kategorie für Lebensmittel gewählt.<br>Im Plan bei «Essen» die Option 🛒 einschalten.</div>`;
+    html += '<div class="empty">Noch keine Kategorie für Lebensmittel gewählt.<br>Im Plan bei «Essen» die Option 🛒 einschalten.</div>';
   } else if (!fs.months.length) {
     html += `<div class="empty"><div class="big">🛒</div>Nach dem ersten Import siehst du hier, wie viel du pro Monat für Lebensmittel ausgibst, aufgeteilt nach Laden.<br><br>Gezählt wird alles in der Kategorie «${esc(cbi[fs.categoryId]?.name || '')}».</div>`;
   } else {
@@ -1067,7 +1310,7 @@ function openRules() {
   const rules = [...S.rules].sort((a, b) => (a.label || a.key).localeCompare(b.label || b.key, 'de'));
   const html = `${sheetHead('Gelernte Läden')}
     <p class="small muted" style="margin:0 2px 10px">Wenn du eine Buchung zuordnest und «merken» anlässt, ordnet die App diesen Laden beim nächsten Import automatisch zu. Bekannte Lebensmittelläden (Migros, Coop, Denner, Lidl …) erkennt sie auch ohne Regel.</p>
-    ${rules.length ? `<div class="list">${rules.map((r) => `<div class="row" style="cursor:default"><div class="main"><div class="title">${esc(r.label || r.key)}</div><div class="sub">→ ${esc(cbi[r.categoryId]?.name || 'gelöschte Kategorie')}</div></div><button class="btn ghost small" data-act="rule-del" data-key="${esc(r.key)}" style="color:var(--minus)">Löschen</button></div>`).join('')}</div>` : '<div class="empty">Noch nichts gemerkt.</div>'}`;
+    ${rules.length ? `<div class="list">${rules.map((r) => `<div class="row" style="cursor:default"><div class="main"><div class="title">${esc(r.label || r.key)}</div><div class="sub">→ ${esc(catLabel(cbi[r.categoryId], cbi) || 'gelöschte Kategorie')}</div></div><button class="btn ghost small" data-act="rule-del" data-key="${esc(r.key)}" style="color:var(--minus)">Löschen</button></div>`).join('')}</div>` : '<div class="empty">Noch nichts gemerkt.</div>'}`;
   openSheet(html, { kind: 'rules' });
 }
 
@@ -1077,15 +1320,15 @@ function openInstallHelp() {
       <strong>iPhone (Safari)</strong>
       <ol style="padding-left:20px;margin:8px 0">
         <li>Diese Seite in <b>Safari</b> öffnen.</li>
-        <li>Unten auf <b>Teilen</b> tippen (Quadrat mit Pfeil nach oben).</li>
-        <li><b>Zum Home-Bildschirm</b> wählen und bestätigen.</li>
+        <li>Auf die <b>drei Punkte</b> rechts neben der Adressleiste tippen, dann <b>Teilen</b>. (Ältere iOS-Versionen: direkt der Teilen-Knopf unten.)</li>
+        <li>Nach unten scrollen und <b>Zum Home-Bildschirm</b> wählen. «Als Web-App öffnen» eingeschaltet lassen.</li>
         <li>Die App ab jetzt immer <b>vom Homescreen</b> öffnen.</li>
       </ol>
       <p class="small muted" style="margin:0">Wichtig: Die Homescreen-App hat ihren eigenen Speicher, getrennt von Safari. Lade deine Startdatei oder dein Backup erst in der Homescreen-App. Dort löscht iOS die Daten auch nicht nach 7 Tagen.</p>
     </div>
     <div class="card card-pad">
       <strong>PC (Chrome oder Firefox)</strong>
-      <p class="small" style="margin:6px 0 0">Einfach die Adresse als Lesezeichen speichern. In Chrome kannst du die App über das Symbol in der Adressleiste auch installieren. Um deine Daten vom iPhone zu sehen: auf dem iPhone ein Backup erstellen, per AirDrop an den PC schicken und hier unter «Mehr → Backup laden» öffnen.</p>
+      <p class="small" style="margin:6px 0 0">Einfach die Adresse als Lesezeichen speichern. Um deine Daten vom iPhone zu sehen: auf dem iPhone ein Backup erstellen, per AirDrop an den PC schicken und hier unter «Mehr → Backup laden» öffnen.</p>
     </div>`;
   openSheet(html, { kind: 'help' });
 }
@@ -1179,7 +1422,7 @@ async function importPayload(p) {
   await db.batch(ops);
   S.month = null;
   await load();
-  S.tab = 'uebersicht';
+  S.tab = 'heute';
   closeSheet(true);
   render();
   requestPersist();
@@ -1192,8 +1435,11 @@ async function startEmpty() {
     { id: 'miete', group: 'fixkosten', name: 'Miete', order: 0, early: true },
     { id: 'krankenkasse', group: 'fixkosten', name: 'Krankenkasse', order: 1 },
     { id: 'handy', group: 'fixkosten', name: 'Handy', order: 2 },
+    { id: 'steuern', group: 'fixkosten', name: 'Steuern', order: 3 },
     { id: 'essen', group: 'alltag', name: 'Essen', order: 0 },
-    { id: 'freizeit', group: 'alltag', name: 'Freizeit & Diverses', order: 1 },
+    { id: 'freizeit', group: 'alltag', name: 'Freizeit', order: 1 },
+    { id: 'geschenke', group: 'einmalig', name: 'Geschenke', order: 0 },
+    { id: 'reisen', group: 'einmalig', name: 'Reisen', order: 1 },
     { id: 'sparen', group: 'sparen', name: 'Sparen', order: 0 },
   ];
   await db.batch(cats.map((c) => ({ store: 'categories', type: 'put', value: c })));
@@ -1212,7 +1458,7 @@ async function wipe() {
   await db.clearAll();
   S.month = null;
   await load();
-  S.tab = 'uebersicht';
+  S.tab = 'heute';
   render();
   toast('Alle Daten gelöscht.');
 }
@@ -1270,13 +1516,22 @@ function viewReceipt(id) {
 
 // ---------------------------------------------------------------- Aktionen
 
+function gotoTab(tab) {
+  S.tab = tab;
+  if (tab !== 'buchungen') S.txFilter = 'alle';
+  render();
+  window.scrollTo(0, 0);
+}
+
 const ACTIONS = {
-  'tab': (el) => { S.tab = el.dataset.tab; if (S.tab !== 'buchungen') S.txFilter = 'alle'; render(); window.scrollTo(0, 0); },
+  'tab': (el) => gotoTab(el.dataset.tab),
+  'open-invoices': () => { if (S.tab !== 'rechnungen') S.backTab = S.tab; closeSheet(true); gotoTab('rechnungen'); },
+  'goto-month': (el) => { S.month = el.dataset.month || currentMonth(); gotoTab('uebersicht'); },
   'month-prev': () => { S.month = ymAdd(S.month, -1); render(); },
   'month-next': () => { S.month = ymAdd(S.month, 1); render(); },
   'month-today': () => { S.month = currentMonth(); render(); },
   'goto-unc': () => { S.tab = 'buchungen'; S.txFilter = 'ohne'; render(); window.scrollTo(0, 0); },
-  'cat-txs': (el) => { S.tab = 'buchungen'; S.txFilter = 'cat:' + el.dataset.id; render(); window.scrollTo(0, 0); },
+  'cat-txs': (el) => { if (el.dataset.month) S.month = el.dataset.month; S.tab = 'buchungen'; S.txFilter = 'cat:' + el.dataset.id; render(); window.scrollTo(0, 0); },
   'tx-filter': (el) => { S.txFilter = el.dataset.f; render(); },
   'tx-open': (el) => openTx(el.dataset.id),
   'tx-new': () => openTxForm({ source: 'manuell', date: todayISO(), amount: 0 }, true),
@@ -1305,7 +1560,8 @@ const ACTIONS = {
   'cat-open': (el) => openCategory(el.dataset.id),
   'cat-new': (el) => openCategory(null, el.dataset.group),
   'cat-delete': () => deleteCategory(),
-  'entry-add': () => { SH.entries = readEntries(); SH.entries.push({ id: null, amount: '', every: 1, start: S.month, end: null }); refreshEntries(); },
+  'cat-merge': () => openMerge(),
+  'entry-add': () => { SH.entries = readEntries(); SH.entries.push({ id: null, label: '', amount: '', every: 1, start: S.month, end: null }); refreshEntries(); },
   'entry-del': (el) => { SH.entries = readEntries(); SH.entries.splice(Number(el.dataset.i), 1); refreshEntries(); },
   'import-pdf': () => { const i = $('#file-pdf'); i.value = ''; i.click(); },
   'import-confirm': () => confirmImport(),
@@ -1314,6 +1570,7 @@ const ACTIONS = {
   'rules': () => openRules(),
   'rule-del': async (el) => { await db.del('rules', el.dataset.key); await load(); openRules(); render(); },
   'help-install': () => openInstallHelp(),
+  'reminders': async () => { openReminders(MID_DAY, S.settings.payday); await saveSettings({ remindersAdded: true }); render(); toast('Termine geöffnet. Im Kalender auf «Alle hinzufügen» tippen.'); },
   'backup': () => startBackup(),
   'backup-save': () => saveBackupFile(),
   'data-load': () => { const i = $('#file-data'); i.value = ''; i.click(); },
@@ -1341,6 +1598,10 @@ const CHANGES = {
     el.closest('.imp-row').classList.toggle('need', !f.categoryId);
   },
   'imp-learn': (el) => { SH.prep.fresh[Number(el.dataset.i)].learn = el.checked; },
+  'cat-parent': (el) => {
+    const gf = $('[data-groupfield]', sheetRoot);
+    if (gf) gf.style.display = el.value ? 'none' : '';
+  },
 };
 
 document.addEventListener('click', (e) => {
@@ -1358,6 +1619,21 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('change', (e) => {
+  // "+ Neue Kategorie" in jeder Kategorie-Auswahl
+  if (e.target.matches && e.target.matches('select[data-catsel]')) {
+    const sel = e.target;
+    if (sel.value === '__new') {
+      sel.value = sel.dataset.prev || '';
+      askNewCategory().then((id) => {
+        if (!id) return;
+        refreshCatSelects(sel, id);
+        const ch = sel.dataset.change;
+        if (ch && CHANGES[ch]) CHANGES[ch](sel);
+      });
+      return;
+    }
+    sel.dataset.prev = sel.value;
+  }
   const el = e.target.closest('[data-change]');
   if (el && CHANGES[el.dataset.change]) CHANGES[el.dataset.change](el, e);
   // Rhythmus "einmalig" blendet "Bis" aus
@@ -1371,7 +1647,7 @@ document.addEventListener('submit', (e) => {
   const form = e.target.closest('form[data-form]');
   if (!form) return;
   e.preventDefault();
-  const fn = { tx: saveTx, inv: saveInvoice, cat: saveCategory, settings: saveSettingsForm }[form.dataset.form];
+  const fn = { tx: saveTx, inv: saveInvoice, cat: saveCategory, settings: saveSettingsForm, merge: doMerge }[form.dataset.form];
   if (fn) Promise.resolve(fn(form)).catch((err) => { console.error(err); toast(err.message || 'Fehler beim Speichern'); });
 });
 
@@ -1383,6 +1659,11 @@ $('#file-receipt').addEventListener('change', (e) => {
   receiptTarget = null;
 });
 
+// Beim Zurückkommen in die App (z.B. am nächsten Tag) neu zeichnen
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.loaded && !SH) render();
+});
+
 // ---------------------------------------------------------------- Start
 
 function registerSW() {
@@ -1390,7 +1671,7 @@ function registerSW() {
   const ok = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
   if (!ok) return;
   const hadController = !!navigator.serviceWorker.controller;
-  navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
+  navigator.serviceWorker.register('sw.js').then((reg) => reg.update && reg.update()).catch((e) => console.warn('SW', e));
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     if (hadController) toast('Neue Version ist da.', 'Neu laden', () => location.reload(), 8000);
   });

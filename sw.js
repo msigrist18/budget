@@ -1,7 +1,7 @@
 // Service Worker: macht die App offline nutzbar. Er speichert nur den App-Code,
 // nie deine Daten (die liegen in IndexedDB). Bei jeder neuen Version VERSION erhöhen.
 
-const VERSION = 'budget-v1.0.0';
+const VERSION = 'budget-v1.1.0';
 const ASSETS = [
   './',
   './index.html',
